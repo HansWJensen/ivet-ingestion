@@ -1,0 +1,432 @@
+# Technical Design Documents for a Scalable Hierarchical Semantic Ingestion and Session-Aware Retrieval System for Veterinary Triage RAG
+
+## System requirements and design goals
+This report specifies an implementable “version 2” technical design for a veterinary triage RAG system that (a) ingests heterogeneous veterinary medical sources at scale, (b) produces semantically coherent, hierarchy-aware chunks with validated metadata, and (c) supports high-concurrency, session-isolated retrieval using Qdrant deployed in containerized infrastructure. The design emphasizes robustness, auditability, reproducibility, and predictable performance under load.
+
+#Two constraints drive nearly every design decision:
+•	Context quality is a safety feature. Fixed-size chunking can split clinical rules, exceptions, and qualifiers, reducing retrieval precision and increasing the chance of “wrong context.” A clinical RAG chunking evaluation explicitly found chunking strategy materially affects retrieval and downstream quality and compares proposition/semantic/adaptive strategies to mitigate concept splitting and noise. 1
+•	Long-context does not guarantee correct use of evidence. “Lost in the middle” effects show that even when you provide long contexts, LLM performance can degrade when relevant evidence is positioned mid-context; therefore you need disciplined retrieval + packing instead of “retrieve more.” 2
+Operationally, the system must support ~1000 concurrent sessions while maintaining isolation and consistent, validated metadata. Qdrant’s own scaling guidance strongly discourages “collection per user” and instead recommends payload-based multitenancy (typically one collection per embedding model) to avoid unsustainable overhead and instability. 3
+
+#To meet these constraints, the v2 design uses:
+•	Hierarchy-first parsing (document → chapter → section → leaf chunks)
+•	Adaptive semantic chunking with micro-headers (variable-sized, semantics-preserving)
+•	Optional proposition-level chunking for “atomic rules/facts” and high-density retrieval
+•	A strict metadata contract (schema validation + invariants + provenance/versioning)
+•	Payload-indexed, filter-first retrieval with optional ACORN for strict multi-filter accuracy
+•	Hybrid dense+sparse retrieval with built-in RRF fusion, diversity selection (MMR), and optional reranking
+
+Semantic chunking is applied selectively because a systematic evaluation found semantic chunking’s compute cost is not consistently justified by downstream gains, implying that hybrid strategies should be used where they provide measurable benefit. 4
+•	Ingestion System Design Document
+This document defines the ingestion architecture, data model, chunking pipeline, metadata validation rules, embedding production, Qdrant indexing strategy, operational idempotency/versioning, and containerized deployment guidance.
+
+## Architecture and workflow
+The ingestion system is intentionally split into offline/batch ingestion for shared knowledge sources and nearline/streaming ingestion for frequently updated clinical data. This avoids coupling interactive latency to heavy parsing and embedding computation.
+Core services (logical):
+•	Source Connectors: pull/push from structured exports, note systems, guidelines repositories, lab feeds, and/or message buses.
+•	Canonicalizer: converts heterogeneous inputs into a canonical intermediate representation (CIR) with explicit structure, offsets, and stable identifiers.
+•	Hierarchy Extractor: produces a document tree (document/chapter/section/subsection) and/or a clinical-event timeline model for structured records.
+•	Chunker: performs structure-first splitting, then adaptive semantic refinement, micro-header generation, and optional proposition extraction.
+•	Metadata Enricher + Validator: attaches metadata, propagates invariants, validates schema and invariants, computes stable IDs.
+•	Embedding Service: batched embedding generation (dense; optionally sparse) with caching and retry semantics.
+•	Qdrant Writer: idempotent upsert/delete using stable IDs and version gates.
+•	Audit Log + Metrics: immutable logs of pipeline versions, source versions, validation failures, and indexing outcomes.
+High-level flow (knowledge sources and notes):
+Ingest → Canonicalize → Extract hierarchy → Chunk (structure-first → adaptive refine → micro-headers → propositions)
+     → Validate metadata + compute stable IDs → Embed (batched) → Upsert to Qdrant → Snapshot + audit
+High-level flow (structured records):
+Ingest → Normalize events (encounter timeline) → Build “fact chunks” + “window summaries”
+     → Validate metadata + compute stable IDs → Embed → Upsert to Qdrant (session/private corpus) → TTL policy in app
+This separation supports both (a) stable guideline retrieval and (b) session/encounter grounding while keeping each corpus’s lifecycle and performance characteristics distinct.
+•	Data ingestion from heterogeneous veterinary sources
+The system must accept at least three primary source modalities:
+Structured records (high-volume, high update frequency)
+•	Examples: vitals, lab results, medications, exposures, problem lists, procedures, triage intake forms, imaging orders, ICD-like problem codes.
+•	Canonicalization output: timestamped events with standardized keys and consistent units.
+Clinical notes (semi-structured free text)
+•	Examples: SOAP notes, nursing notes, triage notes, discharge summaries, referral letters.
+•	Canonicalization output: sectioned narrative with recognized headers (e.g., S/O/A/P-like patterns), plus offsets for traceability.
+Guidelines and protocols (document-like hierarchy)
+•	Examples: clinic SOPs, tox triage protocols, dosing charts, escalation pathways.
+•	Canonicalization output: document tree with headings and stable section paths.
+Where possible, normalize coded concepts to veterinary terminologies (e.g., VetSCT) and lab identifiers (e.g., LOINC usage in animal health lab messaging). VetSCT is explicitly positioned to reduce ambiguity and support veterinary data sharing, and LOINC is used in animal health networks to identify tests and results in HL7-style workflows. 5
+•	Semantic chunking process
+The chunking pipeline is hierarchy-bounded and non-fixed-size. The goal is to produce retrieval units that are:
+•	semantically coherent,
+•	small enough for efficient retrieval and prompt packing,
+•	reliably “re-attachable” to parent context.
+Structure-first splitting
+Inputs: canonical document structure with section paths and offsets.
+Output: initial leaf candidates bounded by hierarchy nodes.
+Rules:
+•	Never cross a section boundary when creating a leaf candidate.
+•	Prefer to keep atomic units intact: list items, dosage tables, contraindication blocks, algorithm steps.
+•	For structured records, do not “paragraph chunk”; instead create meaningful clinical “facts” and “windows” (see below).
+A simple baseline structure-first splitter ensures deterministic splitting and reduces compute, consistent with findings that purely semantic chunking is not always worth its overhead. 4
+Adaptive semantic refinement (variable-size within a section)
+Within a large section, create variable-length chunks by extending across sentences (or list items) while semantic continuity holds, stopping at hard limits.
+A clinically evaluated approach similar in spirit to the one described as “adaptive chunking” extends chunks until semantic similarity drops or a cap is reached and can add micro-headers to stabilize retrieval. 1
+Recommended refinement algorithm (engineering spec):
+•	Unit of extension: sentence for prose; list item for structured lists; row-group for tables.
+•	Similarity: cosine similarity of unit embeddings (use a lightweight embedding model for chunking decisions, potentially distinct from the retrieval embedding model).
+•	Continuation threshold: sim >= τ_continue (tune per corpus).
+•	Topic-shift threshold: sim <= τ_break (hysteresis prevents oscillation).
+•	Hard caps:
+•	MAX_TOKENS_LEAF (e.g., 250–450 tokens) for leaf chunks.
+•	MIN_TOKENS_LEAF (e.g., 80–120 tokens) to avoid trivial chunks.
+•	Soft targets: allow the chunk to grow when it remains coherent, but stop before it becomes “prompt packing hostile.”
+Why enforce caps: LLMs can underutilize long contexts and degrade when key evidence is buried; disciplined chunk sizing supports better packing. 2
+Micro-header generation
+Each leaf chunk receives a short, structured micro-header that reduces ambiguity and supports reranking and packing without inflating chunk bodies.
+Micro-header format (recommended):
+•	H: <section_path_short> | <topic label> | <species constraints if any>
+•	K: <3–8 keywords / coded concepts>
+•	S: <one-sentence gist, ≤ 25 words>
+Micro-headers should be generated deterministically where possible:
+•	For guidelines: derive topic label from heading text + first “definitional” sentence.
+•	For notes: derive from identified section type + extracted clinical entities.
+•	For structured facts: derive from event type (“vital”, “lab”, “med”, “exposure”) + key field.
+In clinical chunking evaluations, “micro-headers” are presented as an approach to help retrieval and downstream relevance by adding structured context. 1
+Proposition-level chunking (optional, selective)
+Proposition chunks are atomic statements suitable for:
+•	contraindications,
+•	dose constraints,
+•	triage triggers,
+•	“if/then” rules,
+•	critical warnings (species-specific toxicity).
+Proposition chunks are created only from sections tagged as “rule-like” or “safety-critical,” to manage compute.
+Recommended proposition extraction approaches:
+•	deterministic rule extraction for bullet lists and tables (“normalize list item into a canonical sentence”),
+•	lightweight clause splitting for long sentences (split on conjunctions when both clauses remain grammatical),
+•	optional LLM-based propositionization in batch mode for highly complex text (guarded by sampling + evaluation).
+The rationale for considering proposition-level segmentation in clinical decision support contexts is explicitly discussed alongside semantic/adaptive strategies in the clinical chunking evaluation. 1
+•	Metadata schema definition and validation rules
+The system uses a single canonical metadata envelope across all indexed objects, with strict validation. The schema is designed to support:
+•	Provenance and versioning (reproducibility, safe re-ingestion)
+•	Hierarchy and navigation (parent-child retrieval, adjacency expansion)
+•	Clinical context filters (species, clinic/tenant, time-validity)
+•	Session isolation (enforced filtering for private data)
+These concepts align with healthcare metadata best practices such as FHIR’s Meta (tags, security labels, source) and the Provenance resource definition (tracking processes and entities influencing a resource). 6
+Canonical metadata envelope (JSON-like)
+{
+  "ids": {
+    "point_id": "ulid/uuid or content-hash",
+    "root_id": "doc:<hash>",
+    "parent_id": "sec:<hash> | chap:<hash> | doc:<hash>",
+    "level": "document|chapter|section|leaf|proposition",
+    "ordinal_in_parent": 0,
+    "prev_id": "optional",
+    "next_id": "optional"
+  },
+  "provenance": {
+    "source_system": "string",
+    "source_uri": "string",
+    "source_last_modified": "RFC3339",
+    "ingested_at": "RFC3339",
+    "doc_version": "string",
+    "doc_hash": "sha256",
+    "pipeline_version": "semver",
+    "chunker_version": "semver",
+    "embedding_model_id": "string"
+  },
+  "security": {
+    "tenant_id": "string",
+    "data_classification": "public|internal|phi|restricted",
+    "session_id": "string|null",
+    "access_scope": "shared_kb|clinic_kb|session_private"
+  },
+  "clinical": {
+    "species": ["dog","cat","rabbit","other"],
+    "breed": "optional",
+    "age_band": "optional",
+    "weight_band": "optional",
+    "codes": {
+      "vetsct": ["..."],
+      "loinc": ["..."],
+      "custom": ["..."]
+    },
+    "time_range": {
+      "start": "RFC3339|null",
+      "end": "RFC3339|null"
+    }
+  },
+  "text": {
+    "section_path": ["..."],
+    "title": "string",
+    "micro_header": "string",
+    "source_offsets": {
+      "start_char": 0,
+      "end_char": 0
+    }
+  }
+}
+Validation invariants (enforced)
+Validation occurs pre-embedding and pre-upsert. Reject or quarantine on failures.
+Hierarchy invariants
+•	level must be one of the allowed enumerations.
+•	parent_id is required for any non-root node.
+•	ordinal_in_parent must be present and stable given the same input version.
+•	section_path must be consistent across siblings: same prefix up to the parent level.
+Provenance invariants
+•	doc_hash and doc_version must be present for shared KB material.
+•	pipeline_version, chunker_version, and embedding_model_id must always be present (critical for reproducibility).
+•	source_offsets must be present for any text extracted from documents/notes for citation traceability.
+Security invariants
+•	tenant_id must exist for all points in a multi-tenant cluster (even “public KB” points should have a tenant_id like global).
+•	session_id must be non-null for access_scope=session_private.
+•	The ingestion writer must never upsert a session_private point without a tenant_id and session_id.
+Clinical invariants
+•	species must be present and must not be empty for any triage-critical corpus where species constraints matter.
+•	Events with timestamps must set time_range.start.
+•	Data transformation and embedding generation pipeline
+Embedding generation is treated as a reproducible build step.
+Key operational requirements:
+•	Embedding calls must be batched and rate-limited.
+•	Results should be cached using a hash of (embedding_model_id, normalized_text) to avoid re-embedding identical content.
+•	Chunk text should be normalized for stable embeddings (Unicode normalization, whitespace collapse, deterministic list formatting).
+Dense embeddings
+•	Input text = micro_header + "\n\n" + chunk_body
+•	Store in named vector dense.
+Sparse embeddings
+•	For hybrid retrieval, store sparse vectors in named vector sparse (or per Qdrant’s hybrid query patterns). Qdrant provides native guidance and examples for dense vs sparse and fusion-based hybrid retrieval. 7
+•	Qdrant indexing strategy and planning
+Collection design
+A practical design uses few collections, optimized by corpus lifecycle:
+•	vet_kb_dense_sparse_v{N}: shared guidelines/protocols (mostly append/update by version)
+•	vet_clinic_notes_dense_sparse_v{N}: clinic-scoped notes (moderate churn)
+•	vet_session_private_dense_v{N}: session/encounter-private facts (high churn; optional sparse)
+Qdrant recommends (in most cases) a single collection per embedding model using payload-based partitioning, while allowing multiple collections when data is non-homogeneous or requires different models/configs. 3
+Payload keys to index
+At minimum, index payload fields that appear in nearly every query filter, because payload indexes materially improve filtered search performance and query planning. 8
+Recommended indexed keys (by collection):
+•	tenant_id (KEYWORD)
+•	access_scope (KEYWORD)
+•	species (KEYWORD)
+•	level (KEYWORD)
+•	parent_id (KEYWORD)
+•	doc_version (KEYWORD)
+•	session_id (KEYWORD) only in session-private collection (consider cardinality implications)
+Qdrant explicitly describes payload indexing as analogous to conventional database indexes and necessary for efficient filtering and query planning. 8
+Shard/replica planning for scalability
+For high concurrency, scale Qdrant with:
+•	Sharding to distribute data and query load.
+•	Replication to increase availability and throughput.
+Qdrant’s distributed deployment guidance describes shard replication for reliability and availability. 9
+Engineering heuristic for initial planning (to be validated with load tests):
+•	Start with shards = number_of_nodes (or 2× nodes for future growth).
+•	Set replication_factor = 2 for HA in production (3 if you require stronger resilience and can afford the write amplification).
+Important: when implementing custom sharding, avoid reusing identical point IDs across shard keys because uniqueness may only be enforced within a shard key and can create inconsistent duplicate semantics. 10
+Custom sharding and tiered multitenancy (optional but powerful)
+If tenants are numerous and filters are strict, consider custom sharding by tenant, so queries route to a tenant’s shard rather than broadcasting. Qdrant’s multitenancy guidance describes “tiered multitenancy” with a fallback shard plus dedicated shards for large tenants and requires specifying a shard key selector to route requests. 11
+This is typically a production optimization: implement only when tenant scale and filter selectivity justify the operational complexity.
+•	Idempotency, versioning, and re-ingestion
+Idempotency is mandatory for safe reprocessing, backfills, and model upgrades.
+Stable IDs
+•	For document-derived nodes: point_id = sha256(root_id + doc_version + level + section_path + ordinal_in_parent + text_hash)
+•	For structured events: point_id = sha256(tenant_id + patient_id + encounter_id + event_type + event_time + normalized_fields)
+Version gates
+•	Never overwrite old guideline content in place unless you retain doc_version as part of the ID or payload and query filters always select the correct version.
+•	Prefer “append new version, then atomically switch retrieval filters” for guideline updates.
+Re-embedding strategy
+•	When changing embedding model: create new collection version (*_v{N+1}) rather than in-place rewriting, then cut over gradually.
+Backups
+•	Use Qdrant snapshots for efficient backup/restore because they include data structures required for efficient restore. 12
+•	Containerized deployment recommendations
+Qdrant’s installation guidance states that production setups are usually easier in Kubernetes or managed deployments for HA, scaling, and DR, while Docker/Docker Compose can be used in production only with additional operational care. 13
+Recommended deployment progression:
+Docker (v2 development and early load testing)
+•	Single-node Qdrant with persistent volumes.
+•	Resource limits/requests set explicitly.
+•	Separate ingestion worker containers from retrieval service containers.
+•	Nightly snapshots and restore drills.
+Kubernetes (staging/production)
+•	Multi-node Qdrant cluster with:
+•	StatefulSets + PVs,
+•	readiness/liveness probes,
+•	node anti-affinity for replicas,
+•	ingress or service mesh for TLS and routing.
+•	Follow an authoritative deployment guide (e.g., cloud-provider tutorials for cluster deployment) for production-grade primitives like node pools and persistent disks. 14
+Security
+•	Enable API key + JWT-based RBAC where applicable; Qdrant documents granular access control with JWT as of v1.9.0. 15
+•	Enforce tenant/session filters in the application layer regardless of DB auth; there is no guarantee that authentication automatically injects tenant filters, so “filter injection” must be handled by your retrieval service. 16
+•	Retrieval and LLM Synthesis Design Document
+This document defines session-aware, multi-stage retrieval, hierarchy-aware expansion, scoring/ranking algorithms, context packing, iterative retrieval loops for complex triage reasoning, and performance engineering for 1000 concurrent sessions.
+•	Retrieval architecture overview
+Retrieval is executed by a stateless Retrieval Gateway service that:
+•	enforces auth and tenant/session constraints,
+•	performs candidate retrieval and ranking,
+•	expands context via parent-child relations,
+•	builds a compact evidence pack with traceable citations,
+•	forwards to the LLM synthesis layer.
+The design is deliberately multi-stage:
+1.	Hard filter for correctness (tenant/species/session/version)
+2.	Hybrid candidate retrieval (dense+sparse)
+3.	Fusion and diversity selection (RRF + MMR)
+4.	Optional reranking (cross-encoder or LLM judge for top-N)
+5.	Hierarchy expansion (parent summaries + sibling adjacency)
+6.	Context packing (token budget + anti–lost-in-middle ordering)
+•	Session isolation and filtering model
+Hard isolation rules
+•	Shared knowledge bases: filter by tenant_id and access_scope in {shared_kb, clinic_kb}.
+•	Session-private patient context: filter by tenant_id and session_id and access_scope=session_private.
+Qdrant strongly recommends payload-based multitenancy (tenant_id in payload) rather than per-user collections. 3
+Filter-first execution
+•	Always include filters in the Qdrant query.
+•	Ensure all frequently filtered fields have payload indexes, since Qdrant indicates vector index accelerates similarity search while payload indexes accelerate filtering. 17
+Strict multi-filter accuracy When queries combine multiple strict filters (common in session + species + doc_version + level constraints), Qdrant notes that standard filtered mechanisms may not provide sufficient accuracy and provides ACORN as an option (available as of v1.16.0) for these cases. 18
+Engineering recommendation: expose a retrieval policy toggle:
+•	default filtered search for most queries,
+•	enable ACORN for queries with strict multi-filter constraints when offline evaluation shows degraded recall/accuracy under the default planner.
+•	Multi-stage retrieval and ranking
+Stage A: Query normalization and intent shaping
+Before vector search, transform the raw user query and session state into a structured retrieval intent:
+•	tenant_id, session_id, species, time_window, kb_versions
+•	retrieval “targets”: guidelines vs patient facts vs prior cases
+•	desired evidence types: triggers, dosing, differentials, escalation criteria
+This stage also constructs two query strings:
+•	one optimized for dense semantic embedding (natural language),
+•	one optimized for sparse lexical retrieval (keywords, drug names, codes).
+Stage B: Hybrid dense+sparse retrieval with RRF fusion
+Qdrant’s hybrid query model supports combining results from multiple retrieval methods and includes Reciprocal Rank Fusion (RRF) as a built-in fusion strategy. 19
+RRF is a well-established ranking fusion method for combining multiple ranked lists. 20
+Implementation pattern
+•	Prefetch top K_dense and top K_sparse.
+•	Apply RRF to produce a fused top K_fused.
+•	Keep the per-retriever ranks for later explainability and debugging.
+Stage C: Diversity-aware selection with MMR-like reranking
+After fusion, enforce diversity to reduce redundant evidence and increase coverage of different relevant aspects (e.g., symptoms vs toxins vs treatment steps). Maximal Marginal Relevance (MMR) explicitly trades off relevance and novelty and is widely used for diversity-based reranking. 21
+Practical design:
+•	Use vector similarity between candidate chunk embeddings as the redundancy signal.
+•	Apply MMR to select K_diverse chunks for packing and for parent expansion.
+Stage D: Optional strong reranking (top-N only)
+For safety-critical queries, add a reranker:
+•	Cross-encoder reranker, or
+•	LLM-as-a-judge reranker with strict constraints and deterministic prompts.
+This stage must be bounded in cost (e.g., rerank top 30 only) and should run behind a circuit breaker so heavy load can degrade gracefully (skip reranking under SLO pressure).
+•	Hierarchical parent-child retrieval and context expansion
+Hierarchy-aware expansion is essential because leaf chunks are intentionally compact.
+Design primitives:
+•	parent_id connects leaf → section node (or chapter node).
+•	section_path and ordinal_in_parent enable deterministic ordering.
+•	prev_id/next_id enable adjacency expansion for continuity.
+Expansion strategy
+1.	Retrieve leaf candidates (post-fusion/post-diversity).
+2.	Group candidates by parent_id and compute a parent score (e.g., max or sum of child scores).
+3.	Fetch:
+•	parent micro-summary node (section-level summary chunk), and
+•	a limited window of siblings around the top child hit (e.g., ±1–2 leaf chunks).
+4.	Pack evidence in an order that makes LLM attention robust:
+•	place the most decisive rules and contraindications early and late,
+•	keep supporting details in the middle.
+This directly mitigates long-context attention weaknesses identified in long-context usage studies. 2
+A hierarchy approach can be extended further by building multi-level summaries (document/chapter/section trees) similar to tree-organized retrieval methods described in hierarchical RAG research (e.g., recursive summarization trees), but this should be optional due to added ingestion cost. 22
+Hierarchy-aware retrieval diagram
+Leaf retrieval (filtered, hybrid) → fused rank list
+          │
+          ▼
+Group by parent_id → pick top parents
+          │
+          ▼
+Fetch parent summary + sibling window around best child
+          │
+          ▼
+Context packer (token budget + ordering)
+          │
+          ▼
+LLM synthesis with citations
+•	Context packing and prompt construction
+Context packing is an engineering discipline, not an afterthought.
+Evidence pack structure (recommended)
+•	System: role, refusal/safety boundaries, citation requirements
+•	Session: patient summary (structured), triage intent, time window
+•	Evidence: ordered list of evidence blocks, each block:
+•	citation_id (stable), source_uri, source_offsets, doc_version
+•	section_path
+•	micro_header
+•	chunk_body (trimmed if needed)
+•	Task: explicit output schema (triage category, reasoning, red flags, next steps)
+Token budget management
+•	Allocate fixed budgets per evidence “type”:
+•	hard rules/contraindications: guaranteed budget slice
+•	patient facts: guaranteed slice
+•	optional background: opportunistic slice
+•	Use a truncation strategy that preserves:
+•	headings, numeric thresholds, dose units, and negations.
+Because long contexts are not robustly utilized, the packer should prioritize positioning and salience of evidence rather than maximizing token count. 2
+•	Iterative or agentic retrieval loops (bounded and auditable)
+For complex triage reasoning, implement an iterative retrieval loop that is:
+•	capped at N iterations (e.g., 2–4),
+•	bounded in candidate counts,
+•	auditable (log each query, filters, and evidence chosen).
+Loop pattern:
+1.	Initial retrieval from user query + session state.
+2.	LLM proposes missing slots (e.g., “need toxin management protocol” or “need species-specific contraindications”).
+3.	Retrieval gateway issues targeted retrieval calls with strict filters.
+4.	Evidence pack updated; LLM synthesizes final answer.
+This loop must not be allowed to broaden scope across tenants or outside the session’s allowed filters—filters are injected server-side, not generated by the model.
+•	Performance and concurrency engineering
+Key performance constraints:
+•	Retrieval gateway must be stateless and horizontally scalable.
+•	Qdrant connections must be pooled.
+•	Latency SLOs should assume occasional reranker bypass.
+gRPC connection pooling If you use gRPC between services (or from retrieval gateway to Qdrant), official gRPC performance guidance recommends pooling channels for high-load areas and distributing RPCs across multiple connections. 23
+Load balancing
+•	Use a layer-7 load balancer in front of the retrieval gateway.
+•	For Qdrant clusters, route to any cluster endpoint; ensure timeouts, retries, and backpressure are configured conservatively.
+Backpressure and degradation
+•	Implement admission control:
+•	cap concurrent reranker executions,
+•	cap maximum Qdrant requests per user request,
+•	fall back to “dense-only” or “hybrid without rerank” under load.
+•	Use cached retrieval for repeated queries within a session (short TTL).
+Filtered search tuning
+•	Ensure payload indexes exist for core filters (tenant/species/session) because Qdrant stresses payload indexes are essential for filtered search performance. 8
+•	Enable ACORN selectively for strict multi-filter queries that show degraded accuracy; Qdrant documents ACORN specifically for these scenarios. 18
+•	Implementation blueprint and validation plan
+This section provides a cohesive implementation blueprint (interfaces, storage layout, test strategy, and rollout plan) suitable for engineering teams executing the above designs.
+•	Core interfaces and contracts
+Canonical Intermediate Representation (CIR) contract
+•	DocumentCIR: {doc_id, doc_version, title, nodes[], offsets, source_uri}
+•	Node: {node_id, level, heading, text_blocks[], children[], ordinal}
+•	EventCIR: {tenant_id, patient_id, encounter_id, events[], note_sections[]}
+Ensure every CIR object includes deterministic ordering and raw-to-canonical offset mappings for traceability.
+Chunk object contract
+•	chunk_id, parent_id, level, ordinal_in_parent
+•	micro_header, chunk_body, source_offsets
+•	full metadata envelope (validated)
+•	Qdrant storage layout (practical)
+Named vectors
+•	dense: float vector (cosine)
+•	sparse: sparse vector (for keyword signals) where hybrid retrieval is needed
+Payload layout Flatten core filter fields to top-level payload keys; avoid deeply nested payload fields unless tested, as payload indexing and query planning should be straightforward and predictable. Qdrant’s own indexing guidance emphasizes how payload indexes interact with query planning. 8
+•	Testing and evaluation strategy
+Offline ingestion validation
+•	schema validation unit tests
+•	invariants (parent/child consistency, ordinal uniqueness, stable IDs)
+•	golden-file tests for chunk boundaries on representative documents
+Retrieval correctness tests
+•	tenant/session leakage tests (must always return empty if wrong tenant_id)
+•	version correctness tests (must never mix guideline versions if filters require latest)
+•	hierarchy expansion tests (parent expansion returns correct section path and adjacency)
+Load and stress tests
+•	1000-concurrent-session synthetic workload:
+•	mixture of short queries and complex triage queries
+•	staged retrieval + occasional reranking
+•	Validate:
+•	P95/P99 latency,
+•	error rates,
+•	Qdrant CPU/memory,
+•	cache hit rates,
+•	degraded-mode behavior.
+•	Operational rollout plan
+A safe rollout follows phased adoption:
+•	Phase A (shadow ingestion): Run v2 ingestion in parallel with v1; compare chunk counts, metadata completeness, and retrieval overlap.
+•	Phase B (dual retrieval): Run v1 and v2 retrieval for a subset of traffic; measure answer quality and citation accuracy.
+•	Phase C (cutover by corpus): Move guidelines first (stable corpus), then clinic notes, then session-private facts.
+•	Phase D (scale-out): Introduce sharding/replication and Kubernetes deployment once traffic patterns are understood.
+Use snapshots for backup/restore and migration testing; Qdrant recommends snapshots as the best way to export/import collections efficiently. 12
+•	Security and governance essentials
+•	Configure database access controls (API keys, JWT RBAC) where feasible; Qdrant documents JWT-based granular access control and RBAC foundations. 15
+•	Treat tenant/session filtering as a server-side invariant. Enforce filter injection in the retrieval gateway because relying on client-provided filters is insufficient for isolation guarantees. 16
+•	Use metadata classification tags aligned with healthcare-style labeling patterns (e.g., tags and security labels concepts described in healthcare metadata standards) for future audits and governance. 6
+
