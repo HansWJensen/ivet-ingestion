@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ingestion metadata envelope",
+  "type": "object",
+  "required": ["ids","provenance","security","clinical","text"],
+  "properties": {
+    "ids": {
+      "type": "object",
+      "required": ["point_id","root_id","level","ordinal_in_parent"],
+      "properties": {
+        "point_id": {"type":"string"},
+        "root_id": {"type":"string"},
+        "parent_id": {"type":["string","null"]},
+        "level": {"type":"string","enum":["document","chapter","section","leaf","proposition"]},
+        "ordinal_in_parent": {"type":"integer","minimum":0},
+        "prev_id": {"type":["string","null"]},
+        "next_id": {"type":["string","null"]}
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type":"object",
+      "required":["source_system","source_uri","ingested_at","doc_hash","pipeline_version","chunker_version","embedding_model_id"],
+      "properties":{
+        "source_system":{"type":"string"},
+        "source_uri":{"type":"string","format":"uri"},
+        "source_last_modified":{"type":["string","null"], "format":"date-time"},
+        "ingested_at":{"type":"string","format":"date-time"},
+        "doc_version":{"type":["string","null"]},
+        "doc_hash":{"type":"string"},
+        "pipeline_version":{"type":"string"},
+        "chunker_version":{"type":"string"},
+        "embedding_model_id":{"type":"string"}
+      },
+      "additionalProperties": false
+    },
+    "security": {
+      "type":"object",
+      "required":["tenant_id","data_classification","access_scope"],
+      "properties":{
+        "tenant_id":{"type":"string"},
+        "data_classification":{"type":"string","enum":["public","internal","phi","restricted"]},
+        "session_id":{"type":["string","null"]},
+        "access_scope":{"type":"string","enum":["shared_kb","clinic_kb","session_private"]}
+      },
+      "additionalProperties": false
+    },
+    "clinical": {
+      "type":"object",
+      "required":["species"],
+      "properties":{
+        "species":{
+          "type":"array",
+          "items":{"type":"string","enum":["dog","cat","rabbit","other"]},
+          "minItems":1
+        },
+        "breed":{"type":["string","null"]},
+        "age_band":{"type":["string","null"]},
+        "weight_band":{"type":["string","null"]},
+        "codes":{
+          "type":"object",
+          "properties":{
+            "vetsct":{"type":"array","items":{"type":"string"}},
+            "loinc":{"type":"array","items":{"type":"string"}},
+            "custom":{"type":"array","items":{"type":"string"}}
+          },
+          "additionalProperties": false
+        },
+        "time_range":{
+          "type":"object",
+          "properties":{
+            "start":{"type":["string","null"], "format":"date-time"},
+            "end":{"type":["string","null"], "format":"date-time"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "text": {
+      "type":"object",
+      "required":["section_path","title","micro_header","source_offsets"],
+      "properties":{
+        "section_path":{"type":"array","items":{"type":"string"}},
+        "title":{"type":"string"},
+        "micro_header":{"type":"string"},
+        "chunk_body":{"type":"string"},
+        "source_offsets":{
+          "type":"object",
+          "required":["start_char","end_char"],
+          "properties":{"start_char":{"type":"integer","minimum":0},"end_char":{"type":"integer","minimum":0}}
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "qdrant-chart.fullname" . }}-ingestion
+spec:
+  replicas: {{ .Values.ingestionWorkers.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "qdrant-chart.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "qdrant-chart.name" . }}
+    spec:
+      containers:
+        - name: ingestion-worker
+          image: "{{ .Values.ingestionWorkers.image.repository }}:{{ .Values.ingestionWorkers.image.tag }}"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"

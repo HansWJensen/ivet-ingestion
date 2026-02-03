@@ -1,0 +1,20 @@
+replicaCount: 1
+
+image:
+  repository: qdrant/qdrant
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+ingestionWorkers:
+  replicaCount: 1
+  image:
+    repository: python
+    tag: "3.11-slim"
